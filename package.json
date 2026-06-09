@@ -72,7 +72,7 @@
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vite": "^7.3.3",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.6"
   },
   "pnpm": {
     "_comment_overrides": "@polkadot-api/json-rpc-provider: upstream packaging bug workaround (mirrors product-sdk's monorepo). @novasamatech/host-api*: pinned to exact 0.8.6 — bumped from 0.8.3 to try latest stable. Prior bisection against Polkadot Desktop 0.4.1 (which ships 0.8.0) showed 0.8.0/0.8.2/0.8.3 handshake cleanly while 0.8.4 silently drops host_handshake_request → transport.isReady() never resolves → every host call throws 'Polkadot host is not ready', chain providers go dead with misleading 'Host doesn't support it' log. Verify handshake in Desktop before merging; if broken, revert to 0.8.3.",

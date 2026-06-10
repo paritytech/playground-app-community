@@ -236,10 +236,14 @@ pub struct PointBreakdown {
 /// stays sorted. Saturating on overflow.
 ///
 /// `points_index` is keyed on `u128::MAX - score` so an ascending range scan
-/// returns highest-scoring accounts first. Removal uses `remove(&K, &V)` with
-/// (negated_score, account) — O(D * log n) where D is the number of accounts
-/// at the same score. At our scale (low hundreds of accounts) D is small and
-/// the simpler API beats tracking an insertion nonce per account.
+/// returns highest-scoring accounts first. Removal uses
+/// `remove_by_nonce(&key, nonce)` with the insertion nonce persisted in
+/// `points_nonce` — O(log n) regardless of how many accounts are tied at the
+/// same score. The previous value-based `remove(&K, &V)` walked every tied
+/// duplicate (O(D * log n) in the tie size D) and out-gassed on-chain once a
+/// few hundred accounts shared a score. If the nonce mapping is missing for a
+/// live entry (pre-nonce data, e.g. lazy backfill), we fall back to the old
+/// value-based removal.
 fn award_points(account: Address, delta: u128) {
     if delta == 0 {
         return;
@@ -247,9 +251,15 @@ fn award_points(account: Address, delta: u128) {
     let cur = Storage::account_points().get(&account).unwrap_or(0);
     let new_score = cur.saturating_add(delta);
     if cur > 0 {
-        Storage::points_index().remove(&(u128::MAX - cur), &account);
+        if let Some(nonce) = Storage::points_nonce().get(&account) {
+            Storage::points_index().remove_by_nonce(&(u128::MAX - cur), nonce);
+        } else {
+            // Defensive fallback: entry predates nonce bookkeeping.
+            Storage::points_index().remove(&(u128::MAX - cur), &account);
+        }
     }
-    Storage::points_index().insert(&(u128::MAX - new_score), &account);
+    let nonce = Storage::points_index().insert(&(u128::MAX - new_score), &account);
+    Storage::points_nonce().insert(&account, &nonce);
     Storage::account_points().insert(&account, &new_score);
 }
 
@@ -262,13 +272,20 @@ fn set_points(account: Address, total: u128) {
         return;
     }
     if cur > 0 {
-        Storage::points_index().remove(&(u128::MAX - cur), &account);
+        if let Some(nonce) = Storage::points_nonce().get(&account) {
+            Storage::points_index().remove_by_nonce(&(u128::MAX - cur), nonce);
+        } else {
+            // Defensive fallback: entry predates nonce bookkeeping.
+            Storage::points_index().remove(&(u128::MAX - cur), &account);
+        }
     }
     if total > 0 {
-        Storage::points_index().insert(&(u128::MAX - total), &account);
+        let nonce = Storage::points_index().insert(&(u128::MAX - total), &account);
+        Storage::points_nonce().insert(&account, &nonce);
         Storage::account_points().insert(&account, &total);
     } else {
         Storage::account_points().remove(&account);
+        Storage::points_nonce().remove(&account);
     }
 }
 
@@ -299,11 +316,21 @@ fn set_star_count(domain: &String, domain_idx: u32, new_count: u32) {
         return;
     }
     if cur > 0 {
-        Storage::star_index().remove(&(u32::MAX - cur), &domain_idx);
+        if let Some(nonce) = Storage::star_nonce().get(&domain_idx) {
+            Storage::star_index().remove_by_nonce(&(u32::MAX - cur), nonce);
+        } else {
+            // Defensive fallback: entry predates nonce bookkeeping (or the
+            // count was lazily backfilled by `import_social_counts` without
+            // an index entry — a silent no-op either way).
+            Storage::star_index().remove(&(u32::MAX - cur), &domain_idx);
+        }
     }
     Storage::star_count().insert(domain, &new_count);
     if new_count > 0 {
-        Storage::star_index().insert(&(u32::MAX - new_count), &domain_idx);
+        let nonce = Storage::star_index().insert(&(u32::MAX - new_count), &domain_idx);
+        Storage::star_nonce().insert(&domain_idx, &nonce);
+    } else {
+        Storage::star_nonce().remove(&domain_idx);
     }
 }
 
@@ -351,11 +378,19 @@ fn set_mod_count(domain: &String, domain_idx: u32, new_count: u32) {
         return;
     }
     if cur > 0 {
-        Storage::mod_index().remove(&(u32::MAX - cur), &domain_idx);
+        if let Some(nonce) = Storage::mod_nonce().get(&domain_idx) {
+            Storage::mod_index().remove_by_nonce(&(u32::MAX - cur), nonce);
+        } else {
+            // Defensive fallback: see `set_star_count`.
+            Storage::mod_index().remove(&(u32::MAX - cur), &domain_idx);
+        }
     }
     Storage::mod_count().insert(domain, &new_count);
     if new_count > 0 {
-        Storage::mod_index().insert(&(u32::MAX - new_count), &domain_idx);
+        let nonce = Storage::mod_index().insert(&(u32::MAX - new_count), &domain_idx);
+        Storage::mod_nonce().insert(&domain_idx, &nonce);
+    } else {
+        Storage::mod_nonce().remove(&domain_idx);
     }
 }
 
@@ -648,6 +683,11 @@ struct Storage {
     /// (`OrderedIndexNodeTooLarge` reverts at ~31 inserted rows). T=3
     /// packs at most 5 entries + 6 children and survives 240+ rows.
     points_index: OrderedIndex<u128, Address, 3>,
+    /// `account -> insertion nonce` of its live `points_index` entry.
+    /// Written on every insert, consumed by `remove_by_nonce` so entry
+    /// removal stays O(log n) regardless of score ties. Removed when the
+    /// account is evicted from the leaderboard (`set_points` to 0).
+    points_nonce: Mapping<Address, u64>,
     // --- Mod tracking (no persisted modded_from link) ---
     /// `domain -> # of unique modders who have published a mod of it`.
     mod_count: Mapping<String, u32>,
@@ -660,6 +700,9 @@ struct Storage {
     /// `OrderedIndex` B-tree nodes bounded; reads dereference each
     /// `domain_idx` back to its current domain via `domain_at`.
     mod_index: OrderedIndex<u32, u32, 4>,
+    /// `domain slot -> insertion nonce` of its live `mod_index` entry.
+    /// See `points_nonce` for the rationale.
+    mod_nonce: Mapping<u32, u64>,
 
     // --- Stars ---
     /// `domain -> cumulative star count`. Decremented on unstar.
@@ -670,6 +713,9 @@ struct Storage {
     /// Domains sorted by `u32::MAX - star_count`, value is the domain's
     /// permanent slot in `domain_at`. See `mod_index` for the rationale.
     star_index: OrderedIndex<u32, u32, 4>,
+    /// `domain slot -> insertion nonce` of its live `star_index` entry.
+    /// See `points_nonce` for the rationale.
+    star_nonce: Mapping<u32, u64>,
 
     // --- Points blacklist ---
     /// Addresses that can never earn points. Populated by sudo with the
@@ -724,6 +770,13 @@ struct Storage {
     /// re-entry (publish→unpublish→publish) and `import_lineage` re-runs.
     lineage_recorded: Mapping<String, bool>,
 }
+
+// Compile-time shape checks: a full B-tree node for each index must fit the
+// 416-byte storage-value cap, otherwise inserts revert at runtime with
+// `OrderedIndexNodeTooLarge`. Key/value sizes are max encoded bytes:
+// u128 = 16, Address (H160) = 20, u32 = 4.
+const _: () = assert!(OrderedIndex::<u128, Address, 3>::fits_storage_limit(16, 20));
+const _: () = assert!(OrderedIndex::<u32, u32, 4>::fits_storage_limit(4, 4));
 
 #[pvm::contract(cdm = "@w3s/playground-registry")]
 mod playground_registry {
@@ -1629,9 +1682,11 @@ mod playground_registry {
         for e in entries {
             if Storage::info().contains(&e.domain) {
                 // Lazy backfill: write the raw Mapping counts only, do
-                // NOT touch star_index / mod_index. The next live `star`
-                // / mod-credit goes through `set_*_count`, which reads
-                // the imported count, runs a `remove(MAX-cur, domain_idx)`
+                // NOT touch star_index / mod_index (and therefore no
+                // `*_nonce` entry either). The next live `star` /
+                // mod-credit goes through `set_*_count`, which reads the
+                // imported count, finds no stored nonce, and takes the
+                // value-based `remove(MAX-cur, domain_idx)` fallback
                 // — a silent no-op because that bucket was never written —
                 // and then inserts the domain at the new bucket. Net
                 // effect: a single live op promotes the imported domain

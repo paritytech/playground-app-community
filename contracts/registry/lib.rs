@@ -189,7 +189,9 @@ pub struct ModPointEvent {
     pub mod_domain: String,
 }
 
-/// Used by StarPointAwarded / StarPointRefunded.
+/// Used by StarPointAwarded. (There is no StarPointRefunded event: star XP
+/// is one-way per #286/#287 — `unstar` removes the star but never refunds,
+/// and a re-star after an unstar awards nothing, see `star_awarded`.)
 #[derive(Encode, Decode)]
 pub struct StarPointEvent {
     pub recipient: Address,
@@ -236,10 +238,14 @@ pub struct PointBreakdown {
 /// stays sorted. Saturating on overflow.
 ///
 /// `points_index` is keyed on `u128::MAX - score` so an ascending range scan
-/// returns highest-scoring accounts first. Removal uses `remove(&K, &V)` with
-/// (negated_score, account) — O(D * log n) where D is the number of accounts
-/// at the same score. At our scale (low hundreds of accounts) D is small and
-/// the simpler API beats tracking an insertion nonce per account.
+/// returns highest-scoring accounts first. Removal uses
+/// `remove_by_nonce(&key, nonce)` with the insertion nonce persisted in
+/// `points_nonce` — O(log n) regardless of how many accounts are tied at the
+/// same score. The previous value-based `remove(&K, &V)` walked every tied
+/// duplicate (O(D * log n) in the tie size D) and out-gassed on-chain once a
+/// few hundred accounts shared a score. If the nonce mapping is missing for a
+/// live entry (pre-nonce data, e.g. lazy backfill), we fall back to the old
+/// value-based removal.
 fn award_points(account: Address, delta: u128) {
     if delta == 0 {
         return;
@@ -247,9 +253,15 @@ fn award_points(account: Address, delta: u128) {
     let cur = Storage::account_points().get(&account).unwrap_or(0);
     let new_score = cur.saturating_add(delta);
     if cur > 0 {
-        Storage::points_index().remove(&(u128::MAX - cur), &account);
+        if let Some(nonce) = Storage::points_nonce().get(&account) {
+            Storage::points_index().remove_by_nonce(&(u128::MAX - cur), nonce);
+        } else {
+            // Defensive fallback: entry predates nonce bookkeeping.
+            Storage::points_index().remove(&(u128::MAX - cur), &account);
+        }
     }
-    Storage::points_index().insert(&(u128::MAX - new_score), &account);
+    let nonce = Storage::points_index().insert(&(u128::MAX - new_score), &account);
+    Storage::points_nonce().insert(&account, &nonce);
     Storage::account_points().insert(&account, &new_score);
 }
 
@@ -262,13 +274,20 @@ fn set_points(account: Address, total: u128) {
         return;
     }
     if cur > 0 {
-        Storage::points_index().remove(&(u128::MAX - cur), &account);
+        if let Some(nonce) = Storage::points_nonce().get(&account) {
+            Storage::points_index().remove_by_nonce(&(u128::MAX - cur), nonce);
+        } else {
+            // Defensive fallback: entry predates nonce bookkeeping.
+            Storage::points_index().remove(&(u128::MAX - cur), &account);
+        }
     }
     if total > 0 {
-        Storage::points_index().insert(&(u128::MAX - total), &account);
+        let nonce = Storage::points_index().insert(&(u128::MAX - total), &account);
+        Storage::points_nonce().insert(&account, &nonce);
         Storage::account_points().insert(&account, &total);
     } else {
         Storage::account_points().remove(&account);
+        Storage::points_nonce().remove(&account);
     }
 }
 
@@ -299,11 +318,21 @@ fn set_star_count(domain: &String, domain_idx: u32, new_count: u32) {
         return;
     }
     if cur > 0 {
-        Storage::star_index().remove(&(u32::MAX - cur), &domain_idx);
+        if let Some(nonce) = Storage::star_nonce().get(&domain_idx) {
+            Storage::star_index().remove_by_nonce(&(u32::MAX - cur), nonce);
+        } else {
+            // Defensive fallback: entry predates nonce bookkeeping (or the
+            // count was lazily backfilled by `import_social_counts` without
+            // an index entry — a silent no-op either way).
+            Storage::star_index().remove(&(u32::MAX - cur), &domain_idx);
+        }
     }
     Storage::star_count().insert(domain, &new_count);
     if new_count > 0 {
-        Storage::star_index().insert(&(u32::MAX - new_count), &domain_idx);
+        let nonce = Storage::star_index().insert(&(u32::MAX - new_count), &domain_idx);
+        Storage::star_nonce().insert(&domain_idx, &nonce);
+    } else {
+        Storage::star_nonce().remove(&domain_idx);
     }
 }
 
@@ -351,11 +380,19 @@ fn set_mod_count(domain: &String, domain_idx: u32, new_count: u32) {
         return;
     }
     if cur > 0 {
-        Storage::mod_index().remove(&(u32::MAX - cur), &domain_idx);
+        if let Some(nonce) = Storage::mod_nonce().get(&domain_idx) {
+            Storage::mod_index().remove_by_nonce(&(u32::MAX - cur), nonce);
+        } else {
+            // Defensive fallback: see `set_star_count`.
+            Storage::mod_index().remove(&(u32::MAX - cur), &domain_idx);
+        }
     }
     Storage::mod_count().insert(domain, &new_count);
     if new_count > 0 {
-        Storage::mod_index().insert(&(u32::MAX - new_count), &domain_idx);
+        let nonce = Storage::mod_index().insert(&(u32::MAX - new_count), &domain_idx);
+        Storage::mod_nonce().insert(&domain_idx, &nonce);
+    } else {
+        Storage::mod_nonce().remove(&domain_idx);
     }
 }
 
@@ -556,13 +593,16 @@ fn append_app_indices(domain: &String, owner_bytes: &[u8; 20]) -> u32 {
 /// Append a domain to a specific owner's index. Used both during fresh
 /// publish and during cross-owner republish where the global `domain_at`
 /// slot is reused (preserving the domain's stable identifier) but the new
-/// owner needs its own MyApps entry.
+/// owner needs its own MyApps entry. Also records the permanent
+/// `owner_list_member` marker so the re-claim branch in `publish` never
+/// appends the same domain to the same owner's list twice.
 /// Returns the new `owner_app_count` (post-increment) so callers can gate
 /// award logic on slot number without a second storage read.
 fn append_owner_app_index(domain: &String, owner_bytes: &[u8; 20]) -> u32 {
     let owner_count = Storage::owner_app_count().get(owner_bytes).unwrap_or(0);
     Storage::owner_domain_at().insert(&(*owner_bytes, owner_count), domain);
     Storage::owner_index_of().insert(domain, &owner_count);
+    Storage::owner_list_member().insert(&(*owner_bytes, domain.clone()), &true);
     let new_count = owner_count + 1;
     Storage::owner_app_count().insert(owner_bytes, &new_count);
     new_count
@@ -607,11 +647,38 @@ struct Storage {
     domain_at: Mapping<u32, String>,
 
     // --- Per-owner index (My Apps) ---
+    /// `owner -> lifetime slot count` for `owner_domain_at`. Never
+    /// decremented: per-owner lists are append-only (tombstones included),
+    /// and the deploy-reward gate in `publish` relies on the lifetime
+    /// count so unpublishing can't reset the first-two-deploys cap.
     owner_app_count: Mapping<[u8; 20], u32>,
+    /// `(owner, slot) -> domain`. Append-only per owner; entries are NEVER
+    /// removed or compacted. When a domain is unpublished and later
+    /// re-claimed by a DIFFERENT owner, the previous owner's entry is left
+    /// in place as a TOMBSTONE and the domain is appended to the new
+    /// owner's list (see the re-claim branch in `publish`). Attribution
+    /// therefore follows the current `info.owner`, never bare list
+    /// membership: `get_owner_domain_at` hides slots whose domain is
+    /// currently owned by someone else, and `get_point_breakdown` only
+    /// counts domains whose `info.owner` matches the queried account.
     owner_domain_at: Mapping<([u8; 20], u32), String>,
+    /// `(owner, domain) -> true` once `domain` has EVER been appended to
+    /// `owner`'s list above. Permanent (never cleared) — the membership
+    /// test for the cross-owner re-claim branch in `publish`, which must
+    /// not append a duplicate when an owner re-claims a domain already in
+    /// their (possibly tombstoned) list. `owner_index_of` cannot answer
+    /// this: it is keyed by domain only, so the slot it stores is
+    /// meaningless without knowing whose list it indexes.
+    owner_list_member: Mapping<([u8; 20], String), bool>,
 
     // --- Reverse index (domain → slot) ---
     index_of: Mapping<String, u32>,
+    /// `domain -> slot in the CURRENT owner's per-owner list` (repointed by
+    /// `append_owner_app_index` on a cross-owner re-claim). Keyed by domain
+    /// only — recovering WHOSE list the slot indexes requires the current
+    /// `info.owner`. Survives `unpublish`. Currently write-mostly: the
+    /// publish re-claim branch tests membership via `owner_list_member`
+    /// instead, precisely because this map can't distinguish owners.
     owner_index_of: Mapping<String, u32>,
 
     // --- Domain data ---
@@ -648,6 +715,11 @@ struct Storage {
     /// (`OrderedIndexNodeTooLarge` reverts at ~31 inserted rows). T=3
     /// packs at most 5 entries + 6 children and survives 240+ rows.
     points_index: OrderedIndex<u128, Address, 3>,
+    /// `account -> insertion nonce` of its live `points_index` entry.
+    /// Written on every insert, consumed by `remove_by_nonce` so entry
+    /// removal stays O(log n) regardless of score ties. Removed when the
+    /// account is evicted from the leaderboard (`set_points` to 0).
+    points_nonce: Mapping<Address, u64>,
     // --- Mod tracking (no persisted modded_from link) ---
     /// `domain -> # of unique modders who have published a mod of it`.
     mod_count: Mapping<String, u32>,
@@ -660,6 +732,9 @@ struct Storage {
     /// `OrderedIndex` B-tree nodes bounded; reads dereference each
     /// `domain_idx` back to its current domain via `domain_at`.
     mod_index: OrderedIndex<u32, u32, 4>,
+    /// `domain slot -> insertion nonce` of its live `mod_index` entry.
+    /// See `points_nonce` for the rationale.
+    mod_nonce: Mapping<u32, u64>,
 
     // --- Stars ---
     /// `domain -> cumulative star count`. Decremented on unstar.
@@ -667,9 +742,20 @@ struct Storage {
     /// `(voter, domain) -> currently starred?`. Toggle state for the
     /// star/unstar pair; absent or false both mean "not currently starred".
     star_given: Mapping<(Address, String), bool>,
+    /// `(voter, domain) -> star XP already paid?`. PERMANENT award dedupe,
+    /// same pattern as `launch_awarded` / `username_bonus_awarded` /
+    /// `mod_credited`: set the first time this voter's star pays the
+    /// domain owner and NEVER cleared — not in `unstar`, not in
+    /// `unpublish`. Star XP is one-way (no refund on unstar), so gating
+    /// the award on the removable `star_given` toggle alone would let a
+    /// star → unstar → star loop re-mint STAR_RECEIVED_XP forever.
+    star_awarded: Mapping<(Address, String), bool>,
     /// Domains sorted by `u32::MAX - star_count`, value is the domain's
     /// permanent slot in `domain_at`. See `mod_index` for the rationale.
     star_index: OrderedIndex<u32, u32, 4>,
+    /// `domain slot -> insertion nonce` of its live `star_index` entry.
+    /// See `points_nonce` for the rationale.
+    star_nonce: Mapping<u32, u64>,
 
     // --- Points blacklist ---
     /// Addresses that can never earn points. Populated by sudo with the
@@ -725,6 +811,13 @@ struct Storage {
     lineage_recorded: Mapping<String, bool>,
 }
 
+// Compile-time shape checks: a full B-tree node for each index must fit the
+// 416-byte storage-value cap, otherwise inserts revert at runtime with
+// `OrderedIndexNodeTooLarge`. Key/value sizes are max encoded bytes:
+// u128 = 16, Address (H160) = 20, u32 = 4.
+const _: () = assert!(OrderedIndex::<u128, Address, 3>::fits_storage_limit(16, 20));
+const _: () = assert!(OrderedIndex::<u32, u32, 4>::fits_storage_limit(4, 4));
+
 #[pvm::contract(cdm = "@w3s/playground-registry")]
 mod playground_registry {
     use super::*;
@@ -775,11 +868,14 @@ mod playground_registry {
     /// pass false. The sudo-managed `blacklisted` map is a second line
     /// of defense for callers that lie or bypass the flag.
     ///
-    /// Points (FIRST publish only, only when visibility=PUBLIC, only when
-    /// `!is_dev_signer`):
-    ///   +1 deploy, +1 playground publish, +1 if `is_moddable`, +1 to the
-    ///   `modded_from` source's owner if it exists, is not self, and this
-    ///   modder hasn't been credited for it before.
+    /// Points (only when visibility=PUBLIC and `!is_dev_signer`):
+    ///   DEPLOY_XP to the owner, only when the domain has NEVER been
+    ///   published before (a domain that ever existed — even since
+    ///   unpublished — never re-awards) and only for the owner's first
+    ///   DEPLOY_REWARD_COUNT such deploys (3rd+ = 0); plus MOD_RECEIVED_XP
+    ///   to the `modded_from` source's owner if the source exists, is not
+    ///   self-owned, and this (caller, source) pair hasn't been credited
+    ///   before.
     /// Re-publishes award nothing — prevents republish-loop farming.
     #[pvm::method]
     pub fn publish(
@@ -814,9 +910,19 @@ mod playground_registry {
         // whether this is a first publish (the only time points are awarded).
         let is_new_app = !Storage::info().contains(&domain);
 
+        // Captured BEFORE any slot allocation below: true iff this domain has
+        // NEVER been published, by anyone. `unpublish` clears `info` but
+        // preserves `index_of`, so a freed-and-re-claimed domain is NOT
+        // truly fresh — the launch-award gate below requires this flag, so a
+        // domain that ever existed never re-earns launch XP.
+        let truly_fresh = !Storage::index_of().contains(&domain);
+
         // Owner's `owner_app_count` AFTER this publish's index append, captured
         // in the new-app branch so the deploy-reward gate below doesn't need
-        // a second storage read. 0 when this is a republish.
+        // a second storage read. Stays 0 on republish and on re-claims that
+        // don't append; the award gate also requires `truly_fresh`, so the
+        // value only matters for genuinely fresh domains (where it is always
+        // >= 1, the post-increment slot number).
         let mut new_owner_app_count: u32 = 0;
 
         match Storage::info().get(&domain) {
@@ -839,16 +945,34 @@ mod playground_registry {
             None => {
                 let effective_owner = owner.unwrap_or(caller);
                 let owner_bytes = *effective_owner.as_fixed_bytes();
-                if !Storage::index_of().contains(&domain) {
+                if truly_fresh {
                     new_owner_app_count = append_app_indices(&domain, &owner_bytes);
-                } else if !Storage::owner_index_of().contains(&domain) {
-                    // Republish with a different owner than the prior one.
-                    // The global `domain_at` slot stays put (preserves
-                    // social-index entries); add the new owner's MyApps
-                    // entry. The launch_awarded marker (checked below) will
-                    // block any award here anyway, so the captured count is
-                    // unused — capturing it is just consistency.
-                    new_owner_app_count = append_owner_app_index(&domain, &owner_bytes);
+                } else {
+                    // Re-claim of a previously-published domain. The global
+                    // `domain_at` slot stays put (preserves social-index
+                    // entries), but MyApps attribution must follow the NEW
+                    // owner. Membership is tested via the permanent
+                    // `owner_list_member` map — NOT via `owner_index_of`,
+                    // which is keyed by domain only and survives
+                    // `unpublish`: its presence says nothing about WHOSE
+                    // list holds the slot, so the old
+                    // `!owner_index_of().contains()` guard was dead code and
+                    // a cross-owner re-claim left the domain attributed to
+                    // the previous owner. (Comparing
+                    // `owner_domain_at((new_owner, slot))` instead would
+                    // mis-answer after an X → Y → X re-claim ping-pong and
+                    // duplicate the domain in X's list — the membership map
+                    // is exact.) The previous owner's `owner_domain_at`
+                    // entry is left behind as a tombstone; readers filter by
+                    // the current `info.owner` (see the field docs). No
+                    // launch XP is at stake either way: the award gate below
+                    // requires `truly_fresh`.
+                    let already_in_owner_list = Storage::owner_list_member()
+                        .get(&(owner_bytes, domain.clone()))
+                        .unwrap_or(false);
+                    if !already_in_owner_list {
+                        new_owner_app_count = append_owner_app_index(&domain, &owner_bytes);
+                    }
                 }
                 Storage::info().insert(&domain, &AppInfo {
                     owner: effective_owner,
@@ -903,12 +1027,20 @@ mod playground_registry {
             None => return,
         };
 
-        // Launch award gating, see #286 / #288: PUBLIC + non-dev-signer +
-        // within the first DEPLOY_REWARD_COUNT app slots for this owner. The
-        // moddable bonus is gone; `is_moddable` stays on the ABI for callers
-        // but no longer changes the award amount.
+        // Launch award rule (#286 / #288): launch XP is paid ONLY for
+        // never-before-published domains (`truly_fresh`), and only for the
+        // owner's first DEPLOY_REWARD_COUNT public, non-dev-signer deploys
+        // (3rd+ = 0). A domain that ever existed — even one unpublished and
+        // re-claimed — never re-awards. `truly_fresh` is load-bearing: a
+        // re-claimed domain skips the index-append branches, leaving
+        // `new_owner_app_count` at 0, which would otherwise satisfy the
+        // `<= DEPLOY_REWARD_COUNT` slot check regardless of how many apps
+        // the owner already launched (the unpublish → republish cap
+        // bypass). The moddable bonus is gone; `is_moddable` stays on the
+        // ABI for callers but no longer changes the award amount.
         let _ = is_moddable;
-        if visibility >= VISIBILITY_PUBLIC
+        if truly_fresh
+            && visibility >= VISIBILITY_PUBLIC
             && !is_dev_signer
             && new_owner_app_count <= DEPLOY_REWARD_COUNT
             && try_award(owner_addr, DEPLOY_XP)
@@ -927,10 +1059,17 @@ mod playground_registry {
         // Dedupe, however, keys on CALLER, not owner_addr. owner_addr is a
         // soft hint the caller passes in `owner`; trusting it for dedupe
         // would let a single signer publish N mods of the same source with
-        // N different throwaway H160s as `owner` and farm N mod credits.
-        // Caller is the actual on-chain signer (sybil-bounded by PoP at
-        // the mobile layer), so per-(caller, source_domain) dedupe holds
-        // the line.
+        // N different throwaway H160s as `owner` and collect N credits for
+        // what is really one (signer, source) pair.
+        //
+        // Scope of the guarantee (per src/xpValues.ts): exactly one
+        // MOD_RECEIVED_XP credit per unique (caller, source_domain) pair —
+        // that is the spec'd award unit, nothing more. It does NOT bound a
+        // recipient's total mod XP: source domains are free to mint, so an
+        // owner can stand up many sources (or modders can spread mods
+        // across them) and each fresh pair pays again. That economy-level
+        // exposure is accepted in xpValues.ts; the only Sybil bound on
+        // callers is PoP account scarcity at the mobile layer.
         //
         // Dev-signer publishes do not award the mod credit either —
         // gating the inner `try_award` on is_dev_signer keeps the dev
@@ -977,9 +1116,13 @@ mod playground_registry {
         }
         // Mark as unpublished by clearing only `info` + `metadata_uri` +
         // pin status. `domain_at`, `index_of`, `owner_domain_at`,
-        // `owner_index_of`, `star_count`, and `mod_count` are preserved so
-        // social-index entries holding `idx` remain valid through any
-        // future republish (see the `None` branch in `publish`).
+        // `owner_index_of`, `owner_list_member`, `star_count`, and
+        // `mod_count` are preserved so social-index entries holding `idx`
+        // remain valid through any future republish (see the `None` branch
+        // in `publish`). The permanent award markers (`launch_awarded`,
+        // `star_awarded`, `mod_credited`) are also intentionally preserved:
+        // unpublish never refunds XP, so clearing them would re-arm the
+        // corresponding one-shot awards.
         Storage::metadata_uri().remove(&domain);
         Storage::info().remove(&domain);
         remove_from_pinned(&domain);
@@ -1040,12 +1183,18 @@ mod playground_registry {
         emit_event(b"RatingRemoved", &domain);
     }
 
-    // --- Stars (toggle: 1 point per (voter, domain), refunded on unstar) ---
+    // --- Stars (toggle; XP is one-way: first star per (voter, domain)
+    //     pays STAR_RECEIVED_XP once, ever — no refund, no re-award) ---
 
-    /// Star an app. Awards +1 point to the app's owner. Caller cannot star
-    /// their own app (`SelfStarForbidden`) and cannot star the same app
-    /// twice (`AlreadyStarred`). The dedupe is on the caller's H160, so
-    /// upstream PoP-gated account scarcity is the Sybil bound.
+    /// Star an app. The FIRST star from a given voter on a given domain
+    /// awards STAR_RECEIVED_XP to the app's owner — once, ever, tracked
+    /// by the permanent `star_awarded` marker. Re-starring after an
+    /// unstar still toggles `star_given` and the counts but awards
+    /// nothing (star XP is one-way; `unstar` does not refund). Caller
+    /// cannot star their own app (`SelfStarForbidden`) and cannot star
+    /// the same app twice without unstarring (`AlreadyStarred`). The
+    /// dedupe is on the caller's H160, so upstream PoP-gated account
+    /// scarcity is the Sybil bound.
     #[pvm::method]
     pub fn star(domain: String) {
         require_unfrozen();
@@ -1071,13 +1220,27 @@ mod playground_registry {
             None => revert(b"DomainNotIndexed"),
         };
         set_star_count(&domain, idx, cur.saturating_add(1));
-        // Social tracking always lands; point award + event gated by blacklist.
-        if try_award(info.owner, STAR_RECEIVED_XP) {
-            emit_typed_event(b"StarPointAwarded", &StarPointEvent {
-                recipient: info.owner,
-                domain,
-                voter,
-            });
+        // Permanent award dedupe (mirrors `launch_awarded` /
+        // `username_bonus_awarded`): pay the owner only the FIRST time this
+        // voter stars this domain. Star XP is one-way (#286: no refund on
+        // unstar), so gating the award on the removable `star_given` toggle
+        // alone would let star → unstar → star re-mint STAR_RECEIVED_XP
+        // forever. The marker is set BEFORE the award call (so even a
+        // blacklisted voter's star permanently consumes the one-shot) and
+        // is never cleared — not in `unstar`, not in `unpublish`. Same
+        // (voter, domain) key construction as `star_given` above.
+        let already_awarded = Storage::star_awarded().get(&key).unwrap_or(false);
+        if !already_awarded {
+            Storage::star_awarded().insert(&key, &true);
+            // Social tracking above always lands; point award + event gated
+            // by the blacklist.
+            if try_award(info.owner, STAR_RECEIVED_XP) {
+                emit_typed_event(b"StarPointAwarded", &StarPointEvent {
+                    recipient: info.owner,
+                    domain,
+                    voter,
+                });
+            }
         }
     }
 
@@ -1105,8 +1268,11 @@ mod playground_registry {
             None => revert(b"DomainNotIndexed"),
         };
         set_star_count(&domain, idx, cur.saturating_sub(1));
-        // No XP refund, no StarPointRefunded event. The `voter` binding stays
-        // because `caller()` still drives the dedupe key above.
+        // No XP refund and no event: star XP is one-way (#286/#287). The
+        // permanent `star_awarded` marker is intentionally NOT cleared here,
+        // so a later re-star toggles `star_given`/counts but pays nothing.
+        // The `voter` binding stays because `caller()` still drives the
+        // dedupe key above.
         let _ = voter;
     }
 
@@ -1136,9 +1302,25 @@ mod playground_registry {
         Storage::owner_app_count().get(owner.as_fixed_bytes()).unwrap_or(0)
     }
 
+    /// Raw slot read for an owner's MyApps list. Per-owner lists are
+    /// append-only with tombstones: a slot whose domain has since been
+    /// re-claimed by a DIFFERENT owner is hidden here (returns `None`) so
+    /// pagination and attribution always follow the current `info.owner` —
+    /// both frontends stamp the queried address as the entry's owner, so
+    /// leaking a tombstone would show someone else's app under this owner.
+    /// Slots whose domain is merely unpublished (no `info`) are still
+    /// returned, matching prior behavior; callers already skip those via
+    /// the missing `metadata_uri`.
     #[pvm::method]
     pub fn get_owner_domain_at(owner: Address, index: u32) -> Option<String> {
-        Storage::owner_domain_at().get(&(*owner.as_fixed_bytes(), index))
+        let domain = Storage::owner_domain_at().get(&(*owner.as_fixed_bytes(), index))?;
+        if let Some(info) = Storage::info().get(&domain) {
+            if info.owner != owner {
+                // Tombstone: re-claimed by another owner after unpublish.
+                return None;
+            }
+        }
+        Some(domain)
     }
 
     // --- Admin management ---
@@ -1471,8 +1653,9 @@ mod playground_registry {
     /// Per-account points broken down by source. Single round-trip read so
     /// the profile UI doesn't fan out into per-app queries. Derived: only
     /// the total is stored; star and mod components are summed from the
-    /// per-domain `star_count`/`mod_count` over the account's owned
-    /// domains, and the launch component is the residual.
+    /// per-domain `star_count`/`mod_count` over the domains the account
+    /// CURRENTLY owns (published, `info.owner == account` — tombstoned and
+    /// unpublished list slots are skipped, see `owner_domain_at`).
     ///
     /// Cost: O(N_owned_apps) — bounded by `owner_app_count[account]`. For
     /// a typical user (≤ a dozen apps) this is a handful of mapping reads.
@@ -1485,6 +1668,16 @@ mod playground_registry {
         let mut mod_points: u128 = 0;
         for i in 0..owned {
             if let Some(domain) = Storage::owner_domain_at().get(&(*owner_bytes, i)) {
+                // Attribution follows the CURRENT `info.owner`: skip
+                // tombstone slots (domain re-claimed by a different owner
+                // after unpublish — its star/mod counts belong to the new
+                // owner's breakdown now) and unpublished domains (no owner
+                // at all; counting them under every list that ever held
+                // them would double-attribute after a re-claim ping-pong).
+                match Storage::info().get(&domain) {
+                    Some(info) if info.owner == account => {}
+                    _ => continue,
+                }
                 star_points = star_points
                     .saturating_add(Storage::star_count().get(&domain).unwrap_or(0) as u128);
                 mod_points = mod_points
@@ -1629,9 +1822,11 @@ mod playground_registry {
         for e in entries {
             if Storage::info().contains(&e.domain) {
                 // Lazy backfill: write the raw Mapping counts only, do
-                // NOT touch star_index / mod_index. The next live `star`
-                // / mod-credit goes through `set_*_count`, which reads
-                // the imported count, runs a `remove(MAX-cur, domain_idx)`
+                // NOT touch star_index / mod_index (and therefore no
+                // `*_nonce` entry either). The next live `star` /
+                // mod-credit goes through `set_*_count`, which reads the
+                // imported count, finds no stored nonce, and takes the
+                // value-based `remove(MAX-cur, domain_idx)` fallback
                 // — a silent no-op because that bucket was never written —
                 // and then inserts the domain at the new bucket. Net
                 // effect: a single live op promotes the imported domain

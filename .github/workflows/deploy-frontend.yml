@@ -71,6 +71,7 @@ jobs:
 
             - name: Install and build
               env:
+                  VITE_ENVIRONMENT: summit
                   VITE_VERSION: ${{ steps.version.outputs.version }}
                   VITE_BUILD_TIME: ${{ steps.version.outputs.build_time }}
                   VITE_SENTRY_ENV: ${{ steps.version.outputs.sentry_env }}

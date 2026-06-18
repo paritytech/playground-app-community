@@ -1,6 +1,6 @@
 {
     "$comment": "Top-level network config — the test networks this app can target. Values are a subset of bulletin-deploy/assets/environments.json (the source of truth); re-sync from there when backends change. Switch networks by changing `active`.",
-    "active": "paseo-next-v2",
+    "active": "summit",
     "networks": {
         "paseo-next-v2": {
             "name": "Paseo Next v2",
@@ -49,7 +49,7 @@
             "dotHost": "dot.li",
             "nativeToEthRatio": 100000000,
             "bulletinFaucetUrl": "https://paritytech.github.io/polkadot-bulletin-chain/authorizations?tab=faucet",
-            "pasFaucetUrl": "https://faucet.polkadot.io/",
+            "pasFaucetUrl": "https://faucet.polkadot.io/summit",
             "contracts": {
                 "registry": "0xFb7AB7E142ED0248D77198CA8722D67C1930D783",
                 "registrar": "0xf3969bCBE60463302306663C62A6A8ef91ab9aA5",

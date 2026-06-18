@@ -18,11 +18,16 @@
 // faucets for the active test network. The rpc/genesis fields in
 // networks.json are vestigial here — chain connections are owned by
 // playground's SDK stack (product-sdk-chain-client / cloud-storage), which
-// resolves endpoints from its own environment presets. Verified: the
-// "paseo" SDK environment IS the chain these contract addresses live on
-// (AH-Next genesis 0xbf0488db…, Bulletin-Next 0x8cfe6717…).
+// resolves endpoints from its own environment presets.
+//
+// Single switch: the active network is ENVIRONMENT (VITE_ENVIRONMENT), the
+// SAME value that selects the SDK chain client and PAPI descriptors in
+// config.ts / utils/contracts.ts. networks.json keys mirror the Environment
+// union, so the builder's contract addresses can never point at a different
+// chain than the rest of the app.
 
 import networksConfig from "./networks.json";
+import { ENVIRONMENT } from "../config.ts";
 
 export interface BuilderNetworkConfig {
   name: string;
@@ -42,10 +47,11 @@ export interface BuilderNetworkConfig {
 }
 
 const networks: Record<string, BuilderNetworkConfig> = networksConfig.networks;
-export const NETWORK: BuilderNetworkConfig = networks[networksConfig.active];
+export const NETWORK: BuilderNetworkConfig = networks[ENVIRONMENT];
 if (!NETWORK) {
   throw new Error(
-    `builder/networks.json: active network "${networksConfig.active}" is not defined`,
+    `builder/networks.json has no entry for ENVIRONMENT="${ENVIRONMENT}". ` +
+      `Add a "${ENVIRONMENT}" network or fix VITE_ENVIRONMENT.`,
   );
 }
 

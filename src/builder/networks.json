@@ -1,8 +1,7 @@
 {
-    "$comment": "Top-level network config — the test networks this app can target. Values are a subset of bulletin-deploy/assets/environments.json (the source of truth); re-sync from there when backends change. Switch networks by changing `active`.",
-    "active": "summit",
+    "$comment": "Builder-local network config — the test networks this app can target. Values are a subset of bulletin-deploy/assets/environments.json (the source of truth); re-sync from there when backends change. The active network is NOT chosen here: builder/config.ts selects networks[ENVIRONMENT], so these keys MUST match the Environment union in src/config.ts (\"paseo\" | \"summit\"). VITE_ENVIRONMENT is the single switch for the whole app.",
     "networks": {
-        "paseo-next-v2": {
+        "paseo": {
             "name": "Paseo Next v2",
             "description": "Next iteration of the Paseo Next testnet",
             "bulletinRpc": "wss://paseo-bulletin-next-rpc.polkadot.io",

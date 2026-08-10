@@ -19,11 +19,12 @@
 // need CHAIN / ENVIRONMENT don't crash on module load.
 const env = (import.meta as { env?: Record<string, string | undefined> }).env ?? {};
 
-/** Networks this build can target. Both have a full descriptor set
+/** Networks this build can target. Each has a full descriptor set
  *  (asset-hub + bulletin + individuality) wired through the Product SDK, and
- *  `CloudStorageClient` only knows these two — so this is the usable universe,
- *  NOT the SDK's wider "polkadot" | "kusama" | "paseo" | "summit". */
-export const ENVIRONMENTS = ["paseo", "summit"] as const;
+ *  `CloudStorageClient` only knows these - so this is the usable universe,
+ *  NOT the SDK's wider "polkadot" | "kusama" | "paseo" | "devnet". `summit`
+ *  was retired upstream (descriptors 0.8.0 dropped it). */
+export const ENVIRONMENTS = ["paseo"] as const;
 export type Environment = (typeof ENVIRONMENTS)[number];
 
 /** Single source of truth for which network the whole app targets — Asset Hub,

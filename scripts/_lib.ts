@@ -29,7 +29,6 @@ import {
 import { secretFromSeed, getPublicKey, HDKD } from "@scure/sr25519";
 import { str, u64 } from "scale-ts";
 import { paseo_asset_hub } from "@parity/product-sdk-descriptors/paseo-asset-hub";
-import { summit_asset_hub } from "@parity/product-sdk-descriptors/summit-asset-hub";
 import { ENVIRONMENTS, type Environment } from "../src/config.ts";
 
 const JUNCTION_ID_LEN = 32;
@@ -120,7 +119,6 @@ export const DEV_ACCOUNTS: `0x${string}`[] = [
 // while networks.json's rpc fields are documented as vestigial for the app.
 const ASSET_HUB_WS: Record<Environment, string> = {
   paseo: "wss://paseo-asset-hub-next-rpc.polkadot.io",
-  summit: "wss://summit-asset-hub-rpc.polkadot.io",
 };
 
 /**
@@ -142,8 +140,8 @@ export function resolveChain(): Environment {
 
 /** PAPI Asset-Hub descriptor for the given chain, matching the frontend's
  *  ENVIRONMENT-keyed selection in `src/utils/contracts.ts`. */
-export function assetHubDescriptor(chain: Environment) {
-  return chain === "summit" ? summit_asset_hub : paseo_asset_hub;
+export function assetHubDescriptor(_chain: Environment) {
+  return paseo_asset_hub;
 }
 
 /**

@@ -21,10 +21,12 @@ const env = (import.meta as { env?: Record<string, string | undefined> }).env ??
 
 /** Networks this build can target. Each has a full descriptor set
  *  (asset-hub + bulletin + individuality) wired through the Product SDK, and
- *  `CloudStorageClient` only knows these - so this is the usable universe,
- *  NOT the SDK's wider "polkadot" | "kusama" | "paseo" | "devnet". `summit`
- *  was retired upstream (descriptors 0.8.0 dropped it). */
-export const ENVIRONMENTS = ["paseo"] as const;
+ *  `CloudStorageClient` only knows these - so this is the usable universe, a
+ *  subset of the SDK's wider "polkadot" | "kusama" | "paseo" | "devnet".
+ *  `summit` was retired upstream (descriptors 0.8.0 dropped it); `devnet` (the
+ *  Polkadot Community Foundation products devnet on the Paseo testnet system
+ *  chains - Asset Hub para 1000) was added alongside `paseo` (Paseo Next v2). */
+export const ENVIRONMENTS = ["paseo", "devnet"] as const;
 export type Environment = (typeof ENVIRONMENTS)[number];
 
 /** Single source of truth for which network the whole app targets — Asset Hub,

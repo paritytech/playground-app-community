@@ -14,6 +14,7 @@
     "build:contracts": "cdm build",
     "typecheck": "tsc -b",
     "deploy": "cdm deploy -n paseo",
+    "deploy:devnet": "cdm deploy -n devnet",
     "preview": "vite preview",
     "deploy:frontend": "MNEMONIC=$(node -e \"process.stdout.write(require(require('os').homedir()+'/.cdm/accounts.json').paseo.mnemonic)\") npx bulletin-deploy --env paseo-next-v2 ./dist playgroundtest.dot",
     "test": "vitest run --project=unit",

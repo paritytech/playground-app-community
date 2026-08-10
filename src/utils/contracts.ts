@@ -39,10 +39,9 @@ import { deriveH160, ss58Decode, toGenericSs58 } from "@parity/product-sdk-addre
 import { seedToAccount } from "@parity/product-sdk-keys";
 import { DEV_PHRASE } from "@polkadot-labs/hdkd-helpers";
 import { submitAndWait } from "../builder/submit-and-wait.ts";
-import { paseo_asset_hub } from "@parity/product-sdk-descriptors/paseo-asset-hub";
-import { paseo_individuality } from "@parity/product-sdk-descriptors/paseo-individuality";
 import { CHAIN, type Environment, PLAYGROUND_DOTNS_ID, DEV_FUNDER_MNEMONIC } from "../config.ts";
 import cdmJson from "../../cdm.json" with { type: "json" };
+import networksConfig from "../builder/networks.json";
 import {
   LIVE_CONTRACTS,
   PLAYGROUND_REGISTRY_CONTRACT,
@@ -186,19 +185,52 @@ if (import.meta.hot) {
 // cdm.json snapshot if the meta-registry call fails.
 // ---------------------------------------------------------------------------
 
-// Tracks the ENVIRONMENT-selected network (currently "paseo" only - summit was
-// retired upstream); the client and every descriptor below move together with
-// it. getChainAPI(CHAIN) returns exactly this type, so no cast is needed at
-// the assignment.
+// Tracks the ENVIRONMENT-selected network ("paseo" | "devnet"); the client and
+// every descriptor below move together with it. getChainAPI(CHAIN) returns
+// exactly this type, so no cast is needed at the assignment.
 type ActiveChainClient = ChainClient<PresetChains<Environment>>;
 
-// PAPI descriptors for the active network, selected in ONE place so Asset Hub
-// and the People chain can't be half-wired when a network is added - extend
-// this together with `ENVIRONMENTS` in config.ts and both update in lockstep.
-// (Bulletin's descriptor is picked inside the SDK from the `environment: CHAIN`
-// string.) `ContractManager.fromLiveClient` is generic over its descriptor, so
-// a future cross-branch union type is accepted as-is.
-const descriptors = { assetHub: paseo_asset_hub, individuality: paseo_individuality };
+// ---------------------------------------------------------------------------
+// Build-time network fold (the bundle-fold). `import.meta.env.VITE_ENVIRONMENT`
+// is inlined as a string literal by Vite, so these ternaries CONSTANT-FOLD and
+// the unselected network's dynamic import() drops out of THIS module: a default
+// build reaches only paseo-asset-hub here, a `VITE_ENVIRONMENT=devnet` build
+// only devnet-asset-hub. Keep the comparison a DIRECT literal on the raw
+// build-time env value - routing it through resolveEnvironment()/ENVIRONMENT (a
+// function result) or a lookup table leaves both import()s reachable and
+// re-emits both ~880 kB metadata chunks (the regression this avoids). Mirrors
+// the merged contract-app devnet PRs (feedback-board#8 / simple-survey#10),
+// adapted to community's VITE_ENVIRONMENT convention.
+//
+// CAVEAT - getChainAPI(CHAIN), used just below to build the live client (and in
+// builder/chain.ts), pulls EVERY preset's descriptor through its own
+// runtime-keyed `loaders[env]` dynamic imports, which cannot be folded. So the
+// paseo AND devnet (and kusama/polkadot) asset-hub metadata chunks are still
+// EMITTED into dist/ regardless of VITE_ENVIRONMENT - unchanged from before this
+// change. This fold is what keeps the descriptor handed to
+// `ContractManager.fromLiveClient` and the People-chain descriptor CORRECT per
+// network; it would additionally become the sole emitter (delivering the
+// one-asset-hub-chunk-per-build win) only if getChainAPI were replaced by a
+// folded `createChainClient({ chains: { assetHub, ... } })`. Left as a follow-up.
+// ---------------------------------------------------------------------------
+
+// Asset Hub descriptor for the active network. The VALUE is used: it decodes
+// the registry ABI inside `fromLiveClient`. `fromLiveClient` is generic over its
+// descriptor, so the paseo|devnet union is accepted as-is.
+const loadAssetHubDescriptor = () =>
+  import.meta.env.VITE_ENVIRONMENT === "devnet"
+    ? import("@parity/product-sdk-descriptors/devnet-asset-hub").then((m) => m.devnet_asset_hub)
+    : import("@parity/product-sdk-descriptors/paseo-asset-hub").then((m) => m.paseo_asset_hub);
+
+// CDM ContractRegistry (meta-registry) address for the active network - passed
+// to `fromLiveClient` as `registryAddress` so a devnet build resolves the
+// registry contract against the devnet CDM registry (0x59b0…) and paseo against
+// its own (0xf62c…, == cdm.json's `registry`, so paseo is unchanged). A plain
+// string, so a runtime networks[ENVIRONMENT] lookup is fine - only the
+// descriptor import() needs the build-time fold above.
+const CDM_REGISTRY_ADDRESS: string | undefined = (
+  networksConfig.networks as Record<string, { cdmRegistry?: string }>
+)[CHAIN]?.cdmRegistry;
 
 export interface ContractsReady {
   client: ActiveChainClient;
@@ -224,6 +256,17 @@ export const contractsReady: Promise<ContractsReady> = (async () => {
       "Chain connection",
     );
 
+    // Build-time-folded Asset Hub descriptor for the active network (see the
+    // fold block above). Loud-fail if the network has no CDM registry configured
+    // rather than silently resolving against cdm.json's (possibly other-network)
+    // snapshot address.
+    const assetHubDescriptor = await loadAssetHubDescriptor();
+    if (!CDM_REGISTRY_ADDRESS) {
+      throw new Error(
+        `builder/networks.json: no cdmRegistry defined for ENVIRONMENT="${CHAIN}"`,
+      );
+    }
+
     // Live address resolution: the CDM meta-registry is queried at boot for
     // each library in LIVE_CONTRACTS, so a fresh deploy is picked up without
     // rebuilding the frontend. ABIs still come from the installed cdm.json
@@ -245,10 +288,11 @@ export const contractsReady: Promise<ContractsReady> = (async () => {
         ContractManager.fromLiveClient(
           cdmJson as unknown as CdmJson,
           client.raw.assetHub,
-          descriptors.assetHub,
+          assetHubDescriptor,
           {
             defaultOrigin: READ_ONLY_QUERY_ORIGIN,
             registryOrigin: READ_ONLY_QUERY_ORIGIN,
+            registryAddress: CDM_REGISTRY_ADDRESS as `0x${string}`,
             libraries: LIVE_CONTRACTS,
           },
         ),
@@ -310,12 +354,19 @@ export const registryReady = contractsReady.then(c => c.registry);
 export const individualityReady: Promise<ActiveChainClient["individuality"]> =
   contractsReady.then(c => c.client.individuality);
 
-/** People-chain DESCRIPTOR (not a live client), ENVIRONMENT-selected to match
- *  the single configured chain. This is the value passed as `peopleChain` to
- *  product-sdk PR #212's `signMessageWithDotNsIdentity` — that API wants a chain
- *  descriptor and manages its own connection, unlike the display resolver which
- *  reads the live `individualityReady` handle. */
-export const peopleChainDescriptor = descriptors.individuality;
+/** People-chain DESCRIPTOR (not a live client), build-time-folded to the active
+ *  network the same way as the Asset Hub descriptor (see the fold block above),
+ *  so a devnet build carries the devnet People-chain descriptor and paseo the
+ *  paseo one. Exposed as a Promise because the fold is a dynamic import(); the
+ *  chunk it resolves is one getChainAPI already loads, so awaiting it is free.
+ *  Passed as `peopleChain` to `signIdentityMessage` (mirrors product-sdk
+ *  `signMessageWithDotNsIdentity`); that adapter currently reads the shared
+ *  `individualityReady` connection and ignores this argument, but it is kept
+ *  network-correct so it stays right if the SDK path starts honoring it. */
+export const peopleChainDescriptor =
+  import.meta.env.VITE_ENVIRONMENT === "devnet"
+    ? import("@parity/product-sdk-descriptors/devnet-individuality").then((m) => m.devnet_individuality)
+    : import("@parity/product-sdk-descriptors/paseo-individuality").then((m) => m.paseo_individuality);
 
 // Arm the snapshot cache with the live-resolved registry address: purges
 // snapshots from a previous deploy (a redeploy resets all XP) and enables

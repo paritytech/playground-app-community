@@ -218,7 +218,7 @@ export async function revealIdentity(callerH160: `0x${string}`): Promise<Identit
     // Pass the People-chain DESCRIPTOR (PR #212 manages its own connection) and
     // OMIT username so the SDK falls back to the host's primary DotNS name.
     const { accountId, signature } = await signIdentityMessage({
-      peopleChain: peopleChainDescriptor,
+      peopleChain: await peopleChainDescriptor,
       message,
     });
 

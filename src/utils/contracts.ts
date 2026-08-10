@@ -31,6 +31,7 @@ import {
   type SignerState,
 } from "@parity/product-sdk-signer";
 import { getAccountsProvider, requestResourceAllocation } from "@parity/product-sdk-host";
+import { unwrapOk } from "@parity/result";
 import type { PolkadotSigner } from "polkadot-api";
 import { Enum } from "polkadot-api";
 import { keccak256, utf8ToBytes, bytesToHex } from "@parity/product-sdk-utils";
@@ -39,10 +40,8 @@ import { seedToAccount } from "@parity/product-sdk-keys";
 import { DEV_PHRASE } from "@polkadot-labs/hdkd-helpers";
 import { submitAndWait } from "../builder/submit-and-wait.ts";
 import { paseo_asset_hub } from "@parity/product-sdk-descriptors/paseo-asset-hub";
-import { summit_asset_hub } from "@parity/product-sdk-descriptors/summit-asset-hub";
 import { paseo_individuality } from "@parity/product-sdk-descriptors/paseo-individuality";
-import { summit_individuality } from "@parity/product-sdk-descriptors/summit-individuality";
-import { CHAIN, ENVIRONMENT, type Environment, PLAYGROUND_DOTNS_ID, DEV_FUNDER_MNEMONIC } from "../config.ts";
+import { CHAIN, type Environment, PLAYGROUND_DOTNS_ID, DEV_FUNDER_MNEMONIC } from "../config.ts";
 import cdmJson from "../../cdm.json" with { type: "json" };
 import {
   LIVE_CONTRACTS,
@@ -187,21 +186,19 @@ if (import.meta.hot) {
 // cdm.json snapshot if the meta-registry call fails.
 // ---------------------------------------------------------------------------
 
-// Tracks the ENVIRONMENT-selected network ("paseo" | "summit"); the client and
-// every descriptor below move together with it. getChainAPI(CHAIN) returns
-// exactly this type, so no cast is needed at the assignment.
+// Tracks the ENVIRONMENT-selected network (currently "paseo" only - summit was
+// retired upstream); the client and every descriptor below move together with
+// it. getChainAPI(CHAIN) returns exactly this type, so no cast is needed at
+// the assignment.
 type ActiveChainClient = ChainClient<PresetChains<Environment>>;
 
-// PAPI descriptors for the active network, selected from ENVIRONMENT in ONE
-// place so Asset Hub and the People chain can't be half-wired when a network is
-// added — extend this branch and both update together. (Bulletin's descriptor
-// is picked inside the SDK from the `environment: CHAIN` string.)
-// `ContractManager.fromLiveClient` is generic over its descriptor, so the
-// cross-branch union type is accepted as-is.
-const descriptors =
-  ENVIRONMENT === "summit"
-    ? { assetHub: summit_asset_hub, individuality: summit_individuality }
-    : { assetHub: paseo_asset_hub, individuality: paseo_individuality };
+// PAPI descriptors for the active network, selected in ONE place so Asset Hub
+// and the People chain can't be half-wired when a network is added - extend
+// this together with `ENVIRONMENTS` in config.ts and both update in lockstep.
+// (Bulletin's descriptor is picked inside the SDK from the `environment: CHAIN`
+// string.) `ContractManager.fromLiveClient` is generic over its descriptor, so
+// a future cross-branch union type is accepted as-is.
+const descriptors = { assetHub: paseo_asset_hub, individuality: paseo_individuality };
 
 export interface ContractsReady {
   client: ActiveChainClient;
@@ -239,19 +236,25 @@ export const contractsReady: Promise<ContractsReady> = (async () => {
     // pass an explicit `{ signer }` via `runTx`/`ensureSignerReady` instead.
     // Setting `defaultOrigin` also suppresses the SDK's per-query
     // `"No origin configured"` warning.
-    const manager = await withDeadline(
-      ContractManager.fromLiveClient(
-        cdmJson as unknown as CdmJson,
-        client.raw.assetHub,
-        descriptors.assetHub,
-        {
-          defaultOrigin: READ_ONLY_QUERY_ORIGIN,
-          registryOrigin: READ_ONLY_QUERY_ORIGIN,
-          libraries: LIVE_CONTRACTS,
-        },
+    // `fromLiveClient` returns a `Result` (contracts 0.10 error API). unwrapOk
+    // rethrows a live-resolution failure into the same catch that already
+    // Sentry-captures + fails the page-load journey below - preserving the
+    // strict-fail boot behavior from before the Result migration.
+    const manager = unwrapOk(
+      await withDeadline(
+        ContractManager.fromLiveClient(
+          cdmJson as unknown as CdmJson,
+          client.raw.assetHub,
+          descriptors.assetHub,
+          {
+            defaultOrigin: READ_ONLY_QUERY_ORIGIN,
+            registryOrigin: READ_ONLY_QUERY_ORIGIN,
+            libraries: LIVE_CONTRACTS,
+          },
+        ),
+        READ_DEADLINE_MS,
+        "Resolving contract addresses",
       ),
-      READ_DEADLINE_MS,
-      "Resolving contract addresses",
     );
     // Boot-time log of the addresses fromLiveClient pulled from the on-chain
     // CDM meta-registry. Cheap to print; saves a lot of guessing the next
@@ -546,34 +549,47 @@ async function requestProductPermissions(account: SignerAccount): Promise<void> 
     smartContractAllowanceGrantedFor = account.address;
     return;
   }
-  let outcomes;
+  let result;
   try {
-    outcomes = await requestResourceAllocationBounded([
-      { tag: "SmartContractAllowance", value: 0 },
+    result = await requestResourceAllocationBounded([
+      // truapi 0.6 typed the derivation index as a tagged union; `Left(0)`
+      // is the plain account-index form the host expands to the 32-byte index.
+      { tag: "SmartContractAllowance", value: { tag: "Left", value: 0 } },
     ]);
   } catch (cause) {
-    // The host throws here when the user dismisses / cancels the allowance
-    // dialog. Re-raise as a typed error so callers can show a cancellation
-    // toast instead of a generic save failure.
+    // A user denial does NOT throw - `requestResourceAllocation` returns
+    // ok(["Rejected"]) for that (handled below). So the only things that THROW
+    // here are a wedged-bridge DeadlineError (retryable) or an unexpected internal
+    // error - neither is a cancel, so don't mislabel them as one.
     console.warn(`[playground] product permissions: ${stringify(cause)}`);
-    captureWarning("requestResourceAllocation failed", { error: stringify(cause) });
-    // A timeout (wedged host bridge) is NOT a cancel — surface DeadlineError's
-    // "temporary connection problem, try again" message so the user retries
-    // rather than thinking they dismissed the dialog.
+    captureWarning("requestResourceAllocation threw", { error: stringify(cause) });
     if (cause instanceof DeadlineError) throw cause;
-    throw new PermissionDeniedError("Permission request was cancelled.");
+    throw new Error("Couldn't request permissions from the host. Please try again.");
   }
-  const [smartContract] = outcomes;
+  if (!result.ok) {
+    // `!ok` is ALWAYS a host-transport failure (HostUnavailableError /
+    // HostCallFailedError), never a user cancel (a denial is ok(["Rejected"])
+    // below). Surface + capture it - do NOT throw PermissionDeniedError here:
+    // OnboardingProvider swallows that as a soft cancel (no toast, no Sentry),
+    // which would make a dead host bridge invisible.
+    const err = stringify(result.error);
+    console.warn(`[playground] product permissions: host unreachable - ${err}`);
+    captureWarning("requestResourceAllocation host failure", { error: err });
+    throw new Error("Couldn't reach the host to request permissions. Please try again.");
+  }
+  // AllocationOutcome is a plain string union ("Allocated" | "Rejected" | ...),
+  // not a { tag } enum. Not-Allocated below = the user DENIED (Rejected).
+  const [smartContract] = result.value;
   // SmartContractAllowance MUST be Allocated for writes to succeed.
-  if (smartContract?.tag === "Allocated") {
+  if (smartContract === "Allocated") {
     smartContractAllowanceGrantedFor = account.address;
     return;
   }
-  const msg = `SmartContractAllowance(0)=${smartContract?.tag ?? "?"}`;
+  const msg = `SmartContractAllowance(0)=${smartContract ?? "?"}`;
   console.warn(`[playground] product permissions: ${msg}`);
-  captureWarning(`product permissions: ${msg}`, { smartContract: smartContract?.tag });
+  captureWarning(`product permissions: ${msg}`, { smartContract: smartContract ?? "?" });
   throw new PermissionDeniedError(
-    `Required permission not granted (smart contract: ${smartContract?.tag ?? "?"}).`,
+    `Required permission not granted (smart contract: ${smartContract ?? "?"}).`,
   );
 }
 
@@ -708,12 +724,13 @@ const FAUCET_FALLBACK_MIN_PAS = 11n * ONE_PAS;
  * dialog for no payoff. Add it back here if/when an SSS surface lands.
  *
  * TAG SPELLING — this browser app talks to the Polkadot Desktop host via
- * `@parity/product-sdk-host` → `@novasamatech/host-api` (v0.8.x), which spells
- * the variant `BulletinAllowance`. The triangle-deploy CLI uses the legacy
- * `BulletInAllowance` (capital I) because its host-papp SSO codec retained the
- * old name — do NOT copy the CLI spelling here, the desktop host rejects it
- * (the whole batch comes back "cancelled"). Same resource `store.ts` documents
- * as enabling host-side Bulletin preimage submission.
+ * `@parity/product-sdk-host` → `@parity/truapi` (0.3.x), which spells the
+ * variant `BulletinAllowance` (re-verify the `AllocatableResource` tag names
+ * against @parity/truapi, not the old `@novasamatech/host-api` that this app no
+ * longer depends on). The triangle-deploy CLI uses the legacy `BulletInAllowance`
+ * (capital I) because its codec retained the old name - do NOT copy the CLI
+ * spelling here, the desktop host rejects it (the batch fails). Same resource
+ * `store.ts` documents as enabling host-side Bulletin preimage submission.
  *
  * Outcome[1] (SmartContractAllowance) is REQUIRED — throws PermissionDeniedError
  * if not Allocated. Outcome[0] (BulletinAllowance) is best-effort — logged as a
@@ -724,47 +741,62 @@ const FAUCET_FALLBACK_MIN_PAS = 11n * ONE_PAS;
  * SmartContractAllowance is not granted.
  */
 async function requestAllAllowances(): Promise<void> {
-  let outcomes;
+  let result;
   try {
     // IMPORTANT: request order determines outcome index. SmartContractAllowance
-    // is index 1 — the only hard requirement. Bulletin is provisioned alongside
+    // is index 1 - the only hard requirement. Bulletin is provisioned alongside
     // it so a single host dialog covers the deploy surface area we use.
     //
-    // Host-api v0.8 spelling: `BulletinAllowance` (NOT the CLI's legacy
+    // truapi spelling: `BulletinAllowance` (NOT the CLI's legacy
     // `BulletInAllowance`). If the host ever rejects the batch, the cause is
     // logged in the catch below.
-    outcomes = await requestResourceAllocationBounded([
+    result = await requestResourceAllocationBounded([
       { tag: "BulletinAllowance", value: undefined },
-      { tag: "SmartContractAllowance", value: 0 },
+      // truapi 0.6 typed the derivation index as a tagged union; `Left(0)`
+      // is the plain account-index form the host expands to the 32-byte index.
+      { tag: "SmartContractAllowance", value: { tag: "Left", value: 0 } },
     ]);
   } catch (cause) {
-    console.warn(`[playground] requestResourceAllocation(batched) failed: ${stringify(cause)}`);
-    captureWarning("requestResourceAllocation(batched) failed", { error: stringify(cause) });
-    // A timeout (wedged host bridge) is NOT a cancel — let DeadlineError's
-    // retryable "try again" message reach the onboarding UI unchanged.
+    console.warn(`[playground] requestResourceAllocation(batched) threw: ${stringify(cause)}`);
+    captureWarning("requestResourceAllocation(batched) threw", { error: stringify(cause) });
+    // A denial doesn't throw (it's ok(["Rejected"]) below) - only a wedged-bridge
+    // DeadlineError (retryable) or an unexpected error throws here. Neither is a
+    // cancel; don't mislabel them as one.
     if (cause instanceof DeadlineError) throw cause;
-    throw new PermissionDeniedError("Permission request was cancelled.");
+    throw new Error("Couldn't request resources from the host. Please try again.");
   }
+  if (!result.ok) {
+    // `!ok` is ALWAYS a host-transport failure (HostUnavailableError /
+    // HostCallFailedError), never a user cancel. Surface + capture - NOT
+    // PermissionDeniedError, which OnboardingProvider swallows as a soft cancel
+    // (no toast, no Sentry), hiding a dead host bridge.
+    const err = stringify(result.error);
+    console.warn(`[playground] requestResourceAllocation(batched): host unreachable - ${err}`);
+    captureWarning("requestResourceAllocation(batched) host failure", { error: err });
+    throw new Error("Couldn't reach the host to request resources. Please try again.");
+  }
+  // AllocationOutcome is a plain string union now ("Allocated" | ...), not { tag }.
+  const outcomes = result.value;
 
   // Log the full outcome array so we can inspect exactly what the host accepted.
   // This is the core diagnostic signal for the prototype.
   console.info("[playground] batched allowances:", stringify(outcomes));
 
-  // BulletinAllowance (index 0) — best-effort; warn but do not throw.
+  // BulletinAllowance (index 0) - best-effort; warn but do not throw.
   const [bulletin, smartContract] = outcomes;
-  if (bulletin?.tag !== "Allocated") {
-    console.warn(`[playground] BulletinAllowance not allocated: ${bulletin?.tag ?? "?"}`);
-    captureWarning("BulletinAllowance not allocated", { tag: bulletin?.tag ?? "?" });
+  if (bulletin !== "Allocated") {
+    console.warn(`[playground] BulletinAllowance not allocated: ${bulletin ?? "?"}`);
+    captureWarning("BulletinAllowance not allocated", { tag: bulletin ?? "?" });
   }
 
-  // SmartContractAllowance (index 1) — REQUIRED. Mirrors the failure path in
+  // SmartContractAllowance (index 1) - REQUIRED. Mirrors the failure path in
   // `requestProductPermissions` so the error message is consistent.
-  if (smartContract?.tag !== "Allocated") {
-    const msg = `SmartContractAllowance(0)=${smartContract?.tag ?? "?"}`;
+  if (smartContract !== "Allocated") {
+    const msg = `SmartContractAllowance(0)=${smartContract ?? "?"}`;
     console.warn(`[playground] batched allowances: ${msg}`);
-    captureWarning(`batched allowances: ${msg}`, { smartContract: smartContract?.tag });
+    captureWarning(`batched allowances: ${msg}`, { smartContract: smartContract ?? "?" });
     throw new PermissionDeniedError(
-      `Required permission not granted (smart contract: ${smartContract?.tag ?? "?"}).`,
+      `Required permission not granted (smart contract: ${smartContract ?? "?"}).`,
     );
   }
 }

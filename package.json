@@ -87,7 +87,7 @@
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vite": "^7.3.5",
-    "vitest": "^3.2.6"
+    "vitest": "^4.1.11"
   },
   "pnpm": {
     "_comment_overrides": "@polkadot-api/json-rpc-provider: upstream packaging bug workaround (mirrors product-sdk's monorepo). @novasamatech/host-api*: pinned exact to 0.8.9. This is NOT just to match @parity/product-sdk-host@0.10.2 (which requests ^0.8.9) — our own direct deps already pin 0.8.9. The override exists to clamp the TRANSITIVE caret edges (product-sdk-host's ^0.8.9, @parity/host-api-test-sdk's ^0.8.8) so a newly-published 0.8.x can't auto-float into the tree unreviewed, and to force host-api to resolve to a SINGLE instance. The single-instance part is load-bearing: product-sdk-host imports host-api both directly and via @novasamatech/host-api-wrapper, and host-api owns the stateful host transport — two resolved copies means two transport singletons, and a handshake/call made through one isn't visible to the other. Bump host-api deliberately and in lockstep (this override, the wrapper override, AND product-sdk-host), never via a floating range.",

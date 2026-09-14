@@ -29,7 +29,7 @@ import {
 import { secretFromSeed, getPublicKey, HDKD } from "@scure/sr25519";
 import { str, u64 } from "scale-ts";
 import { paseo_asset_hub } from "@parity/product-sdk-descriptors/paseo-asset-hub";
-import { summit_asset_hub } from "@parity/product-sdk-descriptors/summit-asset-hub";
+import { devnet_asset_hub } from "@parity/product-sdk-descriptors/devnet-asset-hub";
 import { ENVIRONMENTS, type Environment } from "../src/config.ts";
 
 const JUNCTION_ID_LEN = 32;
@@ -120,7 +120,7 @@ export const DEV_ACCOUNTS: `0x${string}`[] = [
 // while networks.json's rpc fields are documented as vestigial for the app.
 const ASSET_HUB_WS: Record<Environment, string> = {
   paseo: "wss://paseo-asset-hub-next-rpc.polkadot.io",
-  summit: "wss://summit-asset-hub-rpc.polkadot.io",
+  devnet: "wss://asset-hub-paseo-rpc.n.dwellir.com",
 };
 
 /**
@@ -141,9 +141,11 @@ export function resolveChain(): Environment {
 }
 
 /** PAPI Asset-Hub descriptor for the given chain, matching the frontend's
- *  ENVIRONMENT-keyed selection in `src/utils/contracts.ts`. */
+ *  ENVIRONMENT-keyed selection in `src/utils/contracts.ts`. These scripts run
+ *  under tsx in Node (never bundled), so both descriptors are imported
+ *  statically - no build-time fold is needed or possible here. */
 export function assetHubDescriptor(chain: Environment) {
-  return chain === "summit" ? summit_asset_hub : paseo_asset_hub;
+  return chain === "devnet" ? devnet_asset_hub : paseo_asset_hub;
 }
 
 /**

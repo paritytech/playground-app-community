@@ -16,15 +16,15 @@
 
 import { defineConfig } from "bulletin-deploy";
 
+import { frontendDeployPlan } from "./scripts/deploy-frontend";
+
 declare const process: { env?: Record<string, string | undefined> };
 
-// Set APP_DOTNS_DOMAIN to the bare label, e.g. `playground` or `playgroundtest`.
-const domain = process.env?.APP_DOTNS_DOMAIN;
-if (!domain) throw new Error("APP_DOTNS_DOMAIN is required");
-const label = domain.toLowerCase().replace(/\.dot$/, "");
+// Resolve the network's naming suffix alongside the explicit deployment target.
+const { domain } = frontendDeployPlan(process.env?.APP_DEPLOY_ENV, process.env?.APP_DOTNS_DOMAIN);
 
 export default defineConfig({
-  domain: `${label}.dot`,
+  domain,
   displayName: "playground.dot",
   description:
     "Build and mod sovereign apps on Polkadot. A registry browser and quest platform for the Web3 Summit Developer Lab.",

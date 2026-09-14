@@ -24,9 +24,9 @@
 //
 // Network selection follows the app-wide ENVIRONMENT (VITE_ENVIRONMENT) so the
 // builder's gateway + DotNS contracts move in lockstep with the rest of the
-// app rather than from a separate `active` field — a summit gateway paired with
-// paseo contracts would be silently broken. networks.json is keyed by
-// ENVIRONMENT ("paseo" | "summit"), so the lookup is direct.
+// app rather than from a separate `active` field - a mismatched gateway paired
+// with paseo contracts would be silently broken. networks.json is keyed by
+// ENVIRONMENT (currently "paseo" only), so the lookup is direct.
 
 import { ENVIRONMENT } from "../config.ts";
 import networksConfig from "./networks.json";

@@ -53,10 +53,9 @@ jobs:
     outputs:
       cid: ${{ steps.deploy.outputs.cid }}
       # bulletin-deploy strips `.dot` from its `domain` output (returns the bare
-      # label). Surface the caller's input instead so downstream consumers get
-      # the full `<name>.dot` form they passed in.
-      domain: ${{ inputs.dotns-domain }}
-      url: ${{ steps.url.outputs.url }}
+      # label). Surface the normalized full name matching the selected network.
+      domain: ${{ steps.target.outputs.domain }}
+      url: ${{ steps.deploy.outputs.browserUrl }}
     steps:
       # bulletin-deploy auto-discovers bulletin-deploy.config.ts from the
       # repo root and the config references ./assets/icon.png — so the
@@ -101,9 +100,24 @@ jobs:
         # resolve `import { defineConfig } from "bulletin-deploy"` from
         # bulletin-deploy.config.ts when the CLI loads the config.
         run: |
-          npm install -g bulletin-deploy
+          npm install -g bulletin-deploy@0.18.0
           mkdir -p node_modules
           ln -sfn "$(npm root -g)/bulletin-deploy" node_modules/bulletin-deploy
+
+      - name: Resolve deployment domain
+        id: target
+        env:
+          APP_DOTNS_DOMAIN: ${{ inputs.dotns-domain }}
+          APP_DEPLOY_ENV: paseo
+        run: |
+          node --input-type=module <<'JS'
+          import { appendFileSync } from 'node:fs';
+          import { createRequire } from 'node:module';
+          const deployRequire = createRequire(import.meta.resolve('bulletin-deploy'));
+          const { createJiti } = deployRequire('jiti');
+          const config = await createJiti(import.meta.url).import('./bulletin-deploy.config.ts', { default: true });
+          appendFileSync(process.env.GITHUB_OUTPUT, `domain=${config.domain}\n`);
+          JS
 
       - name: Deploy to Bulletin
         id: deploy
@@ -112,30 +126,27 @@ jobs:
           timeout_minutes: 15
           max_attempts: ${{ inputs.max-retries }}
           retry_wait_seconds: 30
-          command: bulletin-deploy './dist' --env paseo-next-v2 ${{ inputs.publish && '--publish' || '' }} '${{ inputs.dotns-domain }}'
+          command: bulletin-deploy './dist' --env paseo-next-v2 ${{ inputs.publish && '--publish' || '' }} '${{ steps.target.outputs.domain }}'
         env:
           MNEMONIC: ${{ secrets.mnemonic }}
           NODE_OPTIONS: "--max-old-space-size=8192"
           # Read by bulletin-deploy.config.ts (defineConfig throws if unset).
-          APP_DOTNS_DOMAIN: ${{ inputs.dotns-domain }}
+          APP_DOTNS_DOMAIN: ${{ steps.target.outputs.domain }}
+          APP_DEPLOY_ENV: paseo
 
       - name: Validate deployment outputs
         run: |
-          if [ -z "${{ steps.deploy.outputs.cid }}" ] || [ -z "${{ steps.deploy.outputs.domain }}" ]; then
+          if [ -z "${{ steps.deploy.outputs.cid }}" ] || [ -z "${{ steps.deploy.outputs.domain }}" ] || [ -z "${{ steps.deploy.outputs.browserUrl }}" ]; then
             echo "::error::Deploy step completed but produced no CID or domain. Likely an OOM or silent crash."
             exit 1
           fi
 
-      - name: Compute browser URL
-        id: url
-        run: echo "url=https://${{ inputs.dotns-domain }}.li" >> "$GITHUB_OUTPUT"
-
       - name: Deployment summary
         run: |
           {
-            echo "### ${{ inputs.dotns-domain }}"
+            echo "### ${{ steps.target.outputs.domain }}"
             echo
-            echo "Browser &nbsp; ${{ steps.url.outputs.url }}"
-            echo "Desktop &nbsp; \`${{ inputs.dotns-domain }}\`"
+            echo "Browser &nbsp; ${{ steps.deploy.outputs.browserUrl }}"
+            echo "Desktop &nbsp; \`${{ steps.target.outputs.domain }}\`"
             echo "CID &nbsp; \`${{ steps.deploy.outputs.cid }}\`"
           } >> "$GITHUB_STEP_SUMMARY"

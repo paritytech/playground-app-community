@@ -14,10 +14,17 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import { defineConfig } from "vite";
+import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 
-export default defineConfig({
+import { resolveEnvironment } from "./src/networkEnvironment";
+
+export default defineConfig(({ mode }) => ({
   plugins: [react()],
+  define: {
+    "import.meta.env.VITE_ENVIRONMENT": JSON.stringify(resolveEnvironment(
+      loadEnv(mode, process.cwd(), "VITE_").VITE_ENVIRONMENT,
+    )),
+  },
   base: "./",
-});
+}));

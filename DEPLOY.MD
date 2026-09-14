@@ -73,7 +73,7 @@ MNEMONIC="$DEPLOY_SURI" pnpm tsx scripts/blacklist-accounts.ts <ADDRESS> <ADDRES
 
 The call is sudo/admin-gated and idempotent — re-running is a cheap no-op. If you populated this registry via the migration in step 2 (`import-registry-state.ts`), the same set was already seeded as that script's step 0, so you can skip this.
 
-> **Targeting a non-default chain.** All the `pnpm tsx scripts/*.ts` helpers in this doc (blacklist, migration, `add-admin`, `pin-apps`, `verify-contracts`) default to `paseo`. For a `summit` deploy, prefix them with `CHAIN=summit` — e.g. `CHAIN=summit MNEMONIC="$DEPLOY_SURI" pnpm tsx scripts/blacklist-accounts.ts`. Only chains with a full product-sdk descriptor set (`paseo`, `summit`) are selectable; the CDM-only `w3s`/`local` presets are not. Point at a one-off endpoint with `ASSET_HUB_WS_URL=<wss://…>`.
+> **Targeting a non-default chain.** All the `pnpm tsx scripts/*.ts` helpers in this doc (blacklist, migration, `add-admin`, `pin-apps`, `verify-contracts`) default to `paseo`. For a `devnet` deploy, prefix them with `CHAIN=devnet`, e.g. `CHAIN=devnet MNEMONIC="$DEPLOY_SURI" pnpm tsx scripts/blacklist-accounts.ts`. Only chains with a full product-sdk descriptor set (`paseo`, `devnet`) are selectable; the CDM-only `w3s`/`local` presets are not. Point at a one-off endpoint with `ASSET_HUB_WS_URL=<wss://...>`.
 
 ### Anti-spam
 
@@ -92,27 +92,27 @@ You can grab the `@w3s/playground-registry` address by visiting `contracts.dot/#
 
 ## 4. Deploy the frontend
 
-Frontend deploys use [polkadot-app-deploy](https://github.com/paritytech/polkadot-app-deploy):
+The repository pins `bulletin-deploy` 0.18.0, whose environment IDs are `paseo-next-v2` and `PCF-devnet`. Use the matching command below; it builds with the selected `VITE_ENVIRONMENT` before deploying that build. Supply `APP_DOTNS_DOMAIN` and an explicit `MNEMONIC` in your environment. No saved account is selected implicitly. Paseo names use `.paseo`; devnet names use `.dot`. The command derives that suffix from the selected network, and sets `APP_DEPLOY_ENV` for the manifest config. `DOTNS_RPC` and `DOTNS_KEY_URI` must be unset so they cannot override the selected network or signer.
 
 ```bash
-npm install -g @parity/polkadot-app-deploy
-polkadot-app-deploy --list-environments    # pick the environment matching your chain (e.g. paseo-next-v2, summit)
+APP_DOTNS_DOMAIN=my-app pnpm deploy:frontend --dry-run
+APP_DOTNS_DOMAIN=my-app pnpm deploy:frontend:devnet --dry-run
+# After reviewing the plan, omit --dry-run to build and deploy.
 ```
 
-```bash
-VITE_SENTRY_DSN="" pnpm build:frontend                      # Build with sentry disabled entirely
-MNEMONIC="$DEPLOY_SURI" polkadot-app-deploy --publish --env <env> ./dist playground.dot
-```
+The dry run prints only network, domain and command arguments; it does not build, connect to a chain, read account files or publish. Current separately installed `bulletin-deploy` versions use different environment names (including `devnet`); do not mix their preset IDs with this pinned CLI.
 
-On a fresh environment the deploy registers `playground.dot`; on re-deploys the mnemonic must own the name. The site is served at `https://playground.dot.li`.
+For the pinned commands, use a bare label in `APP_DOTNS_DOMAIN`; the manifest and CLI receive the same network-specific full name. Existing `.dot` or `.paseo` input suffixes are normalized to the chosen network. The CI preview/release workflow targets Paseo, normalizes its domain through the same manifest configuration, and uses the CLI's returned browser URL instead of constructing a gateway URL.
+
+On a fresh environment the deploy registers the selected name; re-deployment requires ownership. The CLI prints the actual browser URL for its environment.
 
 ### Build-time configuration (`VITE_*`)
 
-All optional — a default `pnpm build:frontend` against the standard environment needs none of these. They're read at build time only ([src/config.ts](src/config.ts), [src/sentry.ts](src/sentry.ts)), so set them inline on the build command (e.g. `VITE_REVX_URL=… pnpm build:frontend`), not on `polkadot-app-deploy`.
+All optional — a default `pnpm build:frontend` against the standard environment needs none of these. They're read at build time only ([src/config.ts](src/config.ts), [src/sentry.ts](src/sentry.ts)), so set them inline on the build command (e.g. `VITE_REVX_URL=… pnpm build:frontend`), not on `bulletin-deploy`.
 
 | Var | Default | Purpose |
 |---|---|---|
-| `VITE_ENVIRONMENT` | `paseo` | Network the whole build targets — Asset Hub, Bulletin, and the People chain move together ([src/config.ts](src/config.ts)). Supported: `paseo`, `summit`. Must match the chain you deployed the registry to (step 2) and the `polkadot-app-deploy --env` (step 4). An explicitly-set unknown value fails the build loudly rather than silently shipping the wrong chain. See note below. |
+| `VITE_ENVIRONMENT` | `paseo` | Network the whole build targets (Asset Hub, Bulletin, and the People chain move together, [src/config.ts](src/config.ts)). Read at BUILD time only. Supported exact lowercase values: `paseo`, `devnet` (no surrounding whitespace). Must match the chain you deployed the registry to (step 2) and the `bulletin-deploy --env` (step 4). An explicitly-set unknown value fails the build loudly rather than silently shipping the wrong chain. See note below. |
 | `VITE_VERSION` | `dev` | Release id — Sentry release tag + about screen. CI sets the short SHA / tag. Unset in a local prod build deliberately skips Sentry init (see below). |
 | `VITE_BUILD_TIME` | empty | UTC ISO build timestamp; display only. CI sets it. |
 | `VITE_SENTRY_DSN` | hardcoded DE/EU DSN in [src/sentry.ts](src/sentry.ts) | Route telemetry to a different project, or set empty to disable — see Telemetry below. |
@@ -129,21 +129,29 @@ All optional — a default `pnpm build:frontend` against the standard environmen
 
 ### Selecting the network (`VITE_ENVIRONMENT`)
 
-`VITE_ENVIRONMENT` picks which chain descriptors (Asset Hub + Bulletin + People/individuality) the frontend bundles. The default `paseo` is the standard environment; set `summit` for a summit build:
+`VITE_ENVIRONMENT` picks which chain descriptors (Asset Hub + Bulletin + People/individuality) the frontend targets. It is read at **build** time only (Vite inlines it). The default `paseo` is the Paseo Next v2 preview net; set `devnet` for a build against the Polkadot Community Foundation products devnet (the public "products devnet" on the Paseo **testnet** system chains, Asset Hub para 1000):
 
 ```bash
-VITE_ENVIRONMENT=summit pnpm build:frontend
+VITE_ENVIRONMENT=devnet pnpm build:frontend
 ```
 
 Three naming spaces line up here — keep them consistent:
 
 | Step | Selector | Example values |
 |---|---|---|
-| Contract deploy (step 2) | CDM `-n <chain>` | `paseo`, `w3s`, `summit` |
-| Frontend build | `VITE_ENVIRONMENT` | `paseo`, `summit` |
-| Frontend deploy (step 4) | `polkadot-app-deploy --env` | `paseo-next-v2`, `summit` |
+| Contract deploy (step 2) | CDM `-n <chain>` | `paseo`, `devnet` |
+| Frontend build | `VITE_ENVIRONMENT` | `paseo`, `devnet` |
+| Pinned frontend deploy (step 4) | `bulletin-deploy --env` | `paseo-next-v2`, `PCF-devnet` |
 
-The registry contract address is **not** pinned in the bundle — it's resolved at boot from the on-chain CDM meta-registry whose address lives in `cdm.json` ([the `registry` field](cdm.json)). That field is set by the `cdm i -n <chain> @w3s/playground-registry` in step 2, so `VITE_ENVIRONMENT` must name the **same chain** you ran `cdm i` against, or the frontend will look for the registry on the wrong network and the Apps grid will come up empty.
+The registry contract address is **not** pinned in the bundle; it's resolved at boot from the on-chain CDM meta-registry. The frontend passes the selected network's CDM registry explicitly (paseo `0xf62c2ece...`, devnet `0x59b0...`, from [`src/builder/networks.json`](src/builder/networks.json) `cdmRegistry`), so `VITE_ENVIRONMENT` must name the **same chain** you ran `cdm i` against, or the frontend will look for the registry on the wrong network and the Apps grid will come up empty.
+
+#### Deploying to devnet
+
+The whole flow uses `-n devnet` in place of `-n paseo`: `cdm deploy -n devnet` (or `pnpm run deploy:devnet`), plus `cdm account map -n devnet`, `cdm account bal -n devnet`, and `cdm i -n devnet @w3s/playground-registry`. Endpoints and the CDM registry come from the preset. Notes:
+
+- The `-n devnet` preset needs **CDM v0.9.0+** (`cdm --version`); older CLIs report `unknown preset`.
+- The PAS faucet for devnet is the **para-1000** one: <https://faucet.polkadot.io/?parachain=1000> (paseo-next uses para 1500).
+- **Deploy the contract to the devnet CDM registry BEFORE shipping a `VITE_ENVIRONMENT=devnet` build.** The frontend resolves the registry address live from the devnet CDM registry at startup and does not fall back to another network's `cdm.json` snapshot, so a devnet build pointed at a network where `@w3s/playground-registry` isn't registered fails at contract init with a resolution error.
 
 ### Dev funder (`VITE_DEV_FUNDER_MNEMONIC`)
 
@@ -161,25 +169,24 @@ VITE_DEV_FUNDER_MNEMONIC="word word … word" pnpm build:frontend   # dev/testne
 
 ### Telemetry (Sentry)
 
-The frontend ships with Sentry error/performance reporting on by default — the DSN is hardcoded in [src/sentry.ts](src/sentry.ts) (publish-only, public-safe). The DSN is baked into the bundle at **build** time, so to change it, set `VITE_SENTRY_DSN` on the `pnpm build:frontend` step above — in place of the plain build command, *not* on `polkadot-app-deploy` (which only ships the already-built `./dist`):
+Telemetry is configured at build time. Set `VITE_SENTRY_DSN` on the matching deployment wrapper command because it rebuilds the frontend before uploading. An unset or empty DSN disables Sentry; a custom DSN also needs `VITE_VERSION` to enable the configured release.
 
 ```bash
-VITE_SENTRY_DSN="" pnpm build:frontend                      # disable Sentry entirely
-VITE_SENTRY_DSN="<your-project-dsn>" pnpm build:frontend    # send to a different project
+# With APP_DOTNS_DOMAIN and MNEMONIC already supplied in your environment:
+VITE_SENTRY_DSN="" pnpm deploy:frontend:devnet
+VITE_SENTRY_DSN="<your-project-dsn>" VITE_VERSION="<release-id>" pnpm deploy:frontend:devnet
 ```
 
-Then run the same `polkadot-app-deploy --env <env> ./dist playground.dot` command to ship it.
-
-(Also: a local `pnpm build:frontend` with no `VITE_VERSION` set skips Sentry init regardless, so stray local bundles never report to the production project.)
+Use `deploy:frontend` for Paseo. Other `VITE_*` build settings likewise belong on the wrapper command or in its inherited environment.
 
 ## Verify
 
 ```bash
 pnpm tsx scripts/verify-contracts.ts            # every cdm.json contract is instantiated on-chain
-curl -sSI https://playground.dot.li | head -1   # 200 OK
+curl -sSI "<browser URL returned by deployment>" | head -1   # 200 OK
 ```
 
-Open `https://playground.dot.li` — the Apps tab loads, the Leaderboard renders, Profile shows your account.
+Open the browser URL returned by deployment — the Apps tab loads, the Leaderboard renders, Profile shows your account.
 
 ### 🛑 **STOP** 🛑
 The rest of the steps assume you have already deployed sample apps to the playground
